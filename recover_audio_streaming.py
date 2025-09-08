@@ -4,16 +4,22 @@ import subprocess
 import struct
 import audioop
 import logging
+import time
+import select
+import socket
+import sys
+import io
 from pathlib import Path
 from collections import defaultdict
 from pydub import AudioSegment
+import dpkt
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class StreamingAudioRecovery:
-    def __init__(self, pcap_file, output_dir="extracted_audio"):
+    def __init__(self, pcap_file, output_dir="extracted_audio", use_whitelist=False, whitelist_ips=None):
         self.pcap_file = pcap_file
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -21,19 +27,81 @@ class StreamingAudioRecovery:
         self.hotline_server_ip = "192.168.0.201"
         self.blacklisted_ips = {"192.168.0.118", "192.168.0.119", "192.168.0.121"}
         
+        # IP白名单机制
+        self.use_whitelist = use_whitelist
+        self.whitelisted_ips = set(whitelist_ips) if whitelist_ips else set()
+        
         # 活跃会话管理
         self.active_sessions = {}  # session_key -> Session对象
         self.stream_to_session = {}  # stream_id -> session_key的映射
         
         self.session_counter = 1
+        
+        # 记录配置信息
+        logger.info(f"IP过滤配置:")
+        logger.info(f"  黑名单: {self.blacklisted_ips}")
+        if self.use_whitelist:
+            logger.info(f"  白名单模式: 启用")
+            logger.info(f"  白名单: {self.whitelisted_ips}")
+        else:
+            logger.info(f"  白名单模式: 禁用")
     
     def is_ip_blacklisted(self, ip):
         """检查IP是否在黑名单中"""
         return ip in self.blacklisted_ips
     
+    def is_ip_whitelisted(self, ip):
+        """检查IP是否在白名单中"""
+        return ip in self.whitelisted_ips
+    
+    def should_process_ip(self, src_ip, dst_ip):
+        """判断是否应该处理这个IP对"""
+        # 首先检查黑名单
+        if self.is_ip_blacklisted(src_ip) or self.is_ip_blacklisted(dst_ip):
+            return False
+        
+        # 如果启用白名单模式
+        if self.use_whitelist:
+            # 获取接线员IP（非热线服务器的IP）
+            operator_ip = src_ip if src_ip != self.hotline_server_ip else dst_ip
+            
+            # 检查接线员IP是否在白名单中
+            if not self.is_ip_whitelisted(operator_ip):
+                return False
+        
+        return True
+    
     def get_stream_id(self, ssrc, src_ip, src_port, dst_ip, dst_port):
         """生成RTP流的唯一标识符（五元组）"""
-        return f"{ssrc:08x}_{src_ip}_{src_port}_{dst_ip}_{dst_port}"
+        try:
+            # 检查是否已经是stream_id格式
+            if isinstance(ssrc, str) and '_' in ssrc:
+                # 可能已经是stream_id，返回原始值
+                logger.warning(f"可能收到了stream_id而不是SSRC: {ssrc}")
+                return ssrc
+                
+            # 确保ssrc是整数
+            if isinstance(ssrc, str):
+                if ssrc.startswith('0x'):
+                    ssrc = int(ssrc, 16)
+                else:
+                    # 尝试十六进制解析
+                    try:
+                        ssrc = int(ssrc, 16)
+                    except ValueError:
+                        # 尝试十进制解析
+                        ssrc = int(ssrc)
+                        
+            # 格式化SSRC为8位十六进制
+            return f"{ssrc & 0xFFFFFFFF:08x}_{src_ip}_{src_port}_{dst_ip}_{dst_port}"
+        except (ValueError, TypeError) as e:
+            logger.error(f"生成stream_id时SSRC格式错误: {ssrc}, 错误: {e}")
+            # 确保返回有效的stream_id
+            if isinstance(ssrc, str):
+                clean_ssrc = ssrc.split('_')[0] if '_' in ssrc else ssrc
+            else:
+                clean_ssrc = str(ssrc)
+            return f"{clean_ssrc}_{src_ip}_{src_port}_{dst_ip}_{dst_port}"
 
     def parse_rtp_packet(self, payload_hex):
         """解析RTP包"""
@@ -118,7 +186,7 @@ class StreamingAudioRecovery:
                 if packet_type == 203 and offset + 8 <= len(payload_bytes):
                     ssrc = struct.unpack('!I', payload_bytes[offset + 4:offset + 8])[0]
                     bye_ssrcs.append(ssrc)
-                    logger.debug(f"检测到RTCP BYE: SSRC {ssrc:08x}")
+                    logger.info(f"检测到RTCP BYE: SSRC {ssrc:08x}")  # 保持提高的日志级别
                 
                 offset += packet_length
                 if offset >= len(payload_bytes):
@@ -139,7 +207,25 @@ class StreamingAudioRecovery:
         peer_ip = dst_ip if src_ip == self.hotline_server_ip else src_ip
         
         # 生成当前流的唯一标识
-        stream_id = self.get_stream_id(ssrc, src_ip, src_port, dst_ip, dst_port)
+        # 确保ssrc是整数
+        if isinstance(ssrc, str):
+            try:
+                if ssrc.startswith('0x'):
+                    ssrc_int = int(ssrc, 16)
+                else:
+                    # 尝试十六进制解析
+                    try:
+                        ssrc_int = int(ssrc, 16)
+                    except ValueError:
+                        # 尝试十进制解析
+                        ssrc_int = int(ssrc)
+                ssrc_hex = f"{ssrc_int & 0xFFFFFFFF:08x}"
+            except (ValueError, TypeError):
+                ssrc_hex = ssrc.split('_')[0] if '_' in ssrc else ssrc
+        else:
+            ssrc_hex = f"{ssrc & 0xFFFFFFFF:08x}"
+            
+        stream_id = f"{ssrc_hex}_{src_ip}_{src_port}_{dst_ip}_{dst_port}"
         
         # 检查是否已经有这个流的会话
         if stream_id in self.stream_to_session:
@@ -195,114 +281,173 @@ class StreamingAudioRecovery:
         logger.info(f"会话 {session_key} 已清理")
 
     def process_pcap_streaming(self):
-        """流式处理PCAP文件或stdin"""
+        """流式处理PCAP文件或stdin，使用dpkt库替代tshark"""
+        # 打开pcap文件或stdin
         if self.pcap_file == '/dev/stdin':
             logger.info("开始流式处理stdin数据")
-            cmd = [
-                'tshark', '-r', '-',  # 从stdin读取pcap数据
-                '-Y', f'udp and (ip.src == {self.hotline_server_ip} or ip.dst == {self.hotline_server_ip})',
-                '-T', 'fields',
-                '-e', 'frame.number',
-                '-e', 'ip.src',
-                '-e', 'ip.dst', 
-                '-e', 'udp.srcport',
-                '-e', 'udp.dstport',
-                '-e', 'udp.payload',
-                '-E', 'header=y',
-                '-E', 'separator=|'
-            ]
+            input_stream = sys.stdin.buffer  # 二进制模式读取stdin
         else:
             logger.info(f"开始流式处理PCAP文件: {self.pcap_file}")
-            cmd = [
-                'tshark', '-r', self.pcap_file,
-                '-Y', f'udp and (ip.src == {self.hotline_server_ip} or ip.dst == {self.hotline_server_ip})',
-                '-T', 'fields',
-                '-e', 'frame.number',
-                '-e', 'ip.src',
-                '-e', 'ip.dst', 
-                '-e', 'udp.srcport',
-                '-e', 'udp.dstport',
-                '-e', 'udp.payload',
-                '-E', 'header=y',
-                '-E', 'separator=|'
-            ]
+            input_stream = open(self.pcap_file, 'rb')
         
         try:
-            # 使用Popen进行真正的流式处理
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                     text=True, bufsize=1, universal_newlines=True)
-            
             logger.info("开始实时处理数据流...")
-            
-            # 跳过标题行
-            header_line = process.stdout.readline()
-            if not header_line:
-                logger.warning("未收到数据")
-                return
-                
-            # 实时处理每一行
             processed_packets = 0
+            last_activity_time = time.time()
             
-            for line in process.stdout:
-                line = line.strip()
-                if not line:
-                    continue
+            logger.info("开始持续监听数据流...")
+            
+            # 创建pcap读取器
+            try:
+                pcap_reader = dpkt.pcap.Reader(input_stream)
+            except Exception as e:
+                logger.error(f"创建pcap读取器失败: {e}")
+                return
+            
+            # 持续读取数据包
+            while True:
+                try:
+                    # 非阻塞读取，使用select模拟
+                    if self.pcap_file == '/dev/stdin':
+                        if not select.select([input_stream], [], [], 1.0)[0]:
+                            # 检查超时
+                            current_time = time.time()
+                            if current_time - last_activity_time > 30:
+                                active_count = len(self.active_sessions)
+                                if active_count > 0:
+                                    logger.info(f"等待数据中... (活跃会话: {active_count}, 已处理: {processed_packets} 包)")
+                                    
+                                    # 检查各个会话是否超时（2分钟无活动）
+                                    timeout_sessions = []
+                                    for session_key, session in self.active_sessions.items():
+                                        if current_time - session.last_activity > 120:  # 2分钟无活动
+                                            timeout_sessions.append(session_key)
+                                    
+                                    if timeout_sessions:
+                                        logger.info(f"检测到 {len(timeout_sessions)} 个会话超时，手动结束")
+                                        for session_key in timeout_sessions:
+                                            logger.info(f"手动结束会话 {session_key} (超时)")
+                                            self.finalize_session(session_key)
+                                        last_activity_time = current_time  # 重置全局活动时间
+                                else:
+                                    logger.info(f"等待新通话中... (已处理: {processed_packets} 包)")
+                                last_activity_time = current_time
+                            continue
                     
-                fields = line.split('|')
-                if len(fields) >= 6:
-                    frame_num, src_ip, dst_ip, src_port, dst_port, payload = fields[:6]
-                    
-                    # IP黑名单过滤
-                    if self.is_ip_blacklisted(src_ip) or self.is_ip_blacklisted(dst_ip):
+                    # 读取下一个数据包
+                    try:
+                        ts, buf = next(pcap_reader)
+                    except StopIteration:
+                        logger.info("数据流结束")
+                        break
+                    except Exception as e:
+                        logger.error(f"读取数据包出错: {e}")
                         continue
                     
-                    # 过滤掉不包含热线服务器IP的包
-                    if self.hotline_server_ip not in [src_ip, dst_ip]:
-                        continue
+                    last_activity_time = time.time()
                     
-                    # 尝试解析为RTP包
-                    rtp_info = self.parse_rtp_packet(payload)
-                    if rtp_info:
-                        ssrc = rtp_info['ssrc']
-                        
-                        # 确定方向
-                        direction = "citizen" if src_ip == self.hotline_server_ip else "hotline"
-                        
-                        # 创建或更新会话
-                        session = self.create_or_update_session(
-                            ssrc, src_ip, dst_ip, int(src_port), int(dst_port), 
-                            direction, rtp_info['codec']
-                        )
-                        
-                        # 如果是自通话包，跳过处理
-                        if session is None:
+                    # 解析以太网帧
+                    try:
+                        # 根据pcap文件类型处理
+                        if pcap_reader.datalink() == dpkt.pcap.DLT_EN10MB:
+                            eth = dpkt.ethernet.Ethernet(buf)
+                            if not isinstance(eth.data, dpkt.ip.IP):
+                                continue
+                            ip = eth.data
+                        elif pcap_reader.datalink() == dpkt.pcap.DLT_LINUX_SLL:
+                            sll = dpkt.sll.SLL(buf)
+                            if not isinstance(sll.data, dpkt.ip.IP):
+                                continue
+                            ip = sll.data
+                        elif pcap_reader.datalink() == dpkt.pcap.DLT_RAW or pcap_reader.datalink() == 101:  # RAW IP
+                            ip = dpkt.ip.IP(buf)
+                        else:
+                            logger.warning(f"不支持的数据链路类型: {pcap_reader.datalink()}")
                             continue
                         
-                        # 添加RTP包到会话
-                        stream_id = self.get_stream_id(ssrc, src_ip, int(src_port), dst_ip, int(dst_port))
-                        session.add_rtp_packet(stream_id, rtp_info)
-                        processed_packets += 1
+                        # 提取IP地址
+                        src_ip = socket.inet_ntoa(ip.src)
+                        dst_ip = socket.inet_ntoa(ip.dst)
                         
-                        if processed_packets % 10000 == 0:
-                            logger.info(f"已处理 {processed_packets} 个RTP包")
-                    
-                    # 尝试解析为RTCP包
-                    bye_ssrcs = self.parse_rtcp_packet(payload)
-                    if bye_ssrcs:
-                        for bye_ssrc in bye_ssrcs:
-                            # 查找包含这个SSRC的所有流
-                            sessions_to_finalize = set()
-                            for stream_id, session_key in self.stream_to_session.items():
-                                if stream_id.startswith(f"{bye_ssrc:08x}_"):
-                                    sessions_to_finalize.add(session_key)
+                        # 过滤掉不包含热线服务器IP的包
+                        if self.hotline_server_ip not in [src_ip, dst_ip]:
+                            continue
+                        
+                        # IP过滤（黑名单 + 白名单）
+                        if not self.should_process_ip(src_ip, dst_ip):
+                            continue
+                        
+                        # 检查是否为UDP
+                        if not isinstance(ip.data, dpkt.udp.UDP):
+                            continue
+                        
+                        udp = ip.data
+                        src_port = udp.sport
+                        dst_port = udp.dport
+                        payload_bytes = udp.data
+                        
+                        # 将payload_bytes转换为十六进制字符串，以便使用现有的解析函数
+                        payload_hex = ''.join(f'{b:02x}' for b in payload_bytes)
+                        
+                        # 尝试解析为RTP包
+                        rtp_info = self.parse_rtp_packet(payload_hex)
+                        if rtp_info:
+                            ssrc = rtp_info['ssrc']
+                            stream_id = self.get_stream_id(ssrc, src_ip, src_port, dst_ip, dst_port)
                             
-                            # 完成相关会话
-                            for session_key in sessions_to_finalize:
-                                logger.info(f"收到SSRC {bye_ssrc:08x} 的BYE信号，完成会话 {session_key}")
-                                self.finalize_session(session_key)
-            
-            # 等待tshark进程结束
-            process.wait()
+                            # 过滤掉自通话
+                            if src_ip == dst_ip == self.hotline_server_ip:
+                                continue
+                            
+                            # 创建或更新会话
+                            direction = "citizen" if src_ip == self.hotline_server_ip else "hotline"
+                            session = self.create_or_update_session(ssrc, src_ip, dst_ip, 
+                                                        src_port, dst_port, direction, rtp_info['codec'])
+                            
+                            # 将RTP数据包添加到会话中
+                            if session:
+                                session.add_rtp_packet(stream_id, rtp_info)
+                                
+                            processed_packets += 1
+                            
+                            if processed_packets % 100 == 0:
+                                logger.debug(f"已处理 {processed_packets} 个RTP包")
+                        
+                        # 尝试解析为RTCP包
+                        bye_ssrcs = self.parse_rtcp_packet(payload_hex)
+                        if bye_ssrcs:
+                            for bye_ssrc in bye_ssrcs:
+                                try:
+                                    # 确保bye_ssrc是整数
+                                    if isinstance(bye_ssrc, str):
+                                        bye_ssrc = int(bye_ssrc, 16) if bye_ssrc.startswith('0x') else int(bye_ssrc)
+                                    
+                                    # 查找包含这个SSRC的所有流
+                                    sessions_to_finalize = set()
+                                    bye_ssrc_hex = f"{bye_ssrc:08x}"
+                                    
+                                    for stream_id, session_key in self.stream_to_session.items():
+                                        if stream_id.startswith(f"{bye_ssrc_hex}_"):
+                                            sessions_to_finalize.add(session_key)
+                                    
+                                    # 完成相关会话
+                                    for session_key in sessions_to_finalize:
+                                        logger.info(f"收到SSRC {bye_ssrc_hex} 的BYE信号，完成会话 {session_key}")
+                                        self.finalize_session(session_key)
+                                        
+                                except (ValueError, TypeError) as e:
+                                    logger.error(f"处理RTCP BYE SSRC时出错: {bye_ssrc}, 错误: {e}")
+                                    continue
+                    except Exception as e:
+                        logger.error(f"处理数据包时出错: {e}")
+                        continue
+                        
+                except KeyboardInterrupt:
+                    logger.info("收到中断信号，正在停止...")
+                    break
+                except Exception as e:
+                    logger.error(f"处理数据时出错: {e}")
+                    continue
             
             # 处理剩余的活跃会话
             remaining_sessions = list(self.active_sessions.keys())
@@ -312,15 +457,21 @@ class StreamingAudioRecovery:
             
             logger.info(f"流式处理完成！总共处理了 {processed_packets} 个RTP包")
             
-        except subprocess.CalledProcessError as e:
-            logger.error(f"tshark执行失败: {e}")
+        except Exception as e:
+            logger.error(f"处理pcap文件出错: {e}")
             raise
+        finally:
+            # 关闭文件（如果不是stdin）
+            if self.pcap_file != '/dev/stdin' and input_stream:
+                input_stream.close()
+    
 
 class Session:
     def __init__(self, session_key, peer_ip):
         self.session_key = session_key
         self.peer_ip = peer_ip
         self.streams = {}  # stream_id -> {'ssrc', 'direction', 'packets', 'codec', 'connection_info'}
+        self.last_activity = time.time()  # 记录最后活动时间
         
     def add_stream(self, stream_id, ssrc, direction, src_ip, dst_ip, src_port, dst_port, codec):
         """添加流到会话"""
@@ -349,6 +500,7 @@ class Session:
         """添加RTP包到指定流"""
         if stream_id in self.streams:
             self.streams[stream_id]['packets'].append(rtp_info)
+            self.last_activity = time.time()  # 更新最后活动时间
     
     def get_all_stream_ids(self):
         """获取会话中的所有流ID"""
@@ -361,7 +513,15 @@ class Session:
         
         # 创建会话文件夹
         ssrc_list = sorted(set(stream_info['ssrc'] for stream_info in self.streams.values()))
-        ssrc_hex_list = [f"{ssrc:08x}" for ssrc in ssrc_list]
+        ssrc_hex_list = []
+        for ssrc in ssrc_list:
+            try:
+                if isinstance(ssrc, str):
+                    ssrc = int(ssrc, 16) if ssrc.startswith('0x') else int(ssrc)
+                ssrc_hex_list.append(f"{ssrc:08x}")
+            except (ValueError, TypeError) as e:
+                logger.error(f"格式化SSRC时出错: {ssrc}, 错误: {e}")
+                ssrc_hex_list.append(str(ssrc))
         
         # 获取接线员IP和端口信息
         operator_ip = self.peer_ip  # 接线员IP（非热线服务器的IP）
@@ -452,13 +612,24 @@ def main():
     parser.add_argument('pcap_file', help='输入的PCAP文件路径（使用/dev/stdin从管道读取）')
     parser.add_argument('output_dir', nargs='?', default='extracted_audio', help='输出目录 (默认: extracted_audio)')
     parser.add_argument('-v', '--verbose', action='store_true', help='详细输出')
+    parser.add_argument('--use-whitelist', action='store_true', help='启用IP白名单模式')
+    parser.add_argument('--whitelist', nargs='+', help='IP白名单列表，例如: --whitelist 192.168.10.91 192.168.5.21')
     
     args = parser.parse_args()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    recovery = StreamingAudioRecovery(args.pcap_file, args.output_dir)
+    # 验证白名单参数
+    if args.use_whitelist and not args.whitelist:
+        parser.error("启用白名单模式时必须提供 --whitelist 参数")
+    
+    recovery = StreamingAudioRecovery(
+        args.pcap_file, 
+        args.output_dir,
+        use_whitelist=args.use_whitelist,
+        whitelist_ips=args.whitelist
+    )
     recovery.process_pcap_streaming()
 
 if __name__ == "__main__":
