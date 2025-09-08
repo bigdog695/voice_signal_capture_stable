@@ -195,35 +195,57 @@ class StreamingAudioRecovery:
         logger.info(f"会话 {session_key} 已清理")
 
     def process_pcap_streaming(self):
-        """流式处理PCAP文件"""
-        logger.info(f"开始流式处理PCAP文件: {self.pcap_file}")
-        
-        cmd = [
-            'tshark', '-r', self.pcap_file,
-            '-Y', f'udp and (ip.src == {self.hotline_server_ip} or ip.dst == {self.hotline_server_ip})',
-            '-T', 'fields',
-            '-e', 'frame.number',
-            '-e', 'ip.src',
-            '-e', 'ip.dst', 
-            '-e', 'udp.srcport',
-            '-e', 'udp.dstport',
-            '-e', 'udp.payload',
-            '-E', 'header=y',
-            '-E', 'separator=|'
-        ]
+        """流式处理PCAP文件或stdin"""
+        if self.pcap_file == '/dev/stdin':
+            logger.info("开始流式处理stdin数据")
+            cmd = [
+                'tshark', '-r', '-',  # 从stdin读取pcap数据
+                '-Y', f'udp and (ip.src == {self.hotline_server_ip} or ip.dst == {self.hotline_server_ip})',
+                '-T', 'fields',
+                '-e', 'frame.number',
+                '-e', 'ip.src',
+                '-e', 'ip.dst', 
+                '-e', 'udp.srcport',
+                '-e', 'udp.dstport',
+                '-e', 'udp.payload',
+                '-E', 'header=y',
+                '-E', 'separator=|'
+            ]
+        else:
+            logger.info(f"开始流式处理PCAP文件: {self.pcap_file}")
+            cmd = [
+                'tshark', '-r', self.pcap_file,
+                '-Y', f'udp and (ip.src == {self.hotline_server_ip} or ip.dst == {self.hotline_server_ip})',
+                '-T', 'fields',
+                '-e', 'frame.number',
+                '-e', 'ip.src',
+                '-e', 'ip.dst', 
+                '-e', 'udp.srcport',
+                '-e', 'udp.dstport',
+                '-e', 'udp.payload',
+                '-E', 'header=y',
+                '-E', 'separator=|'
+            ]
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            lines = result.stdout.strip().split('\n')
+            # 使用Popen进行真正的流式处理
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                     text=True, bufsize=1, universal_newlines=True)
             
-            if len(lines) <= 1:
-                logger.error("未找到符合条件的UDP包")
+            logger.info("开始实时处理数据流...")
+            
+            # 跳过标题行
+            header_line = process.stdout.readline()
+            if not header_line:
+                logger.warning("未收到数据")
                 return
-            
+                
+            # 实时处理每一行
             processed_packets = 0
             
-            for line in lines[1:]:  # 跳过标题行
-                if not line.strip():
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
                     continue
                     
                 fields = line.split('|')
@@ -278,6 +300,9 @@ class StreamingAudioRecovery:
                             for session_key in sessions_to_finalize:
                                 logger.info(f"收到SSRC {bye_ssrc:08x} 的BYE信号，完成会话 {session_key}")
                                 self.finalize_session(session_key)
+            
+            # 等待tshark进程结束
+            process.wait()
             
             # 处理剩余的活跃会话
             remaining_sessions = list(self.active_sessions.keys())
@@ -424,8 +449,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='从PCAP文件中流式恢复音频')
-    parser.add_argument('pcap_file', help='输入的PCAP文件路径')
-    parser.add_argument('-o', '--output', default='extracted_audio', help='输出目录 (默认: extracted_audio)')
+    parser.add_argument('pcap_file', help='输入的PCAP文件路径（使用/dev/stdin从管道读取）')
+    parser.add_argument('output_dir', nargs='?', default='extracted_audio', help='输出目录 (默认: extracted_audio)')
     parser.add_argument('-v', '--verbose', action='store_true', help='详细输出')
     
     args = parser.parse_args()
@@ -433,7 +458,7 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    recovery = StreamingAudioRecovery(args.pcap_file, args.output)
+    recovery = StreamingAudioRecovery(args.pcap_file, args.output_dir)
     recovery.process_pcap_streaming()
 
 if __name__ == "__main__":
