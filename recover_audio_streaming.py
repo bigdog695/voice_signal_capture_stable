@@ -246,6 +246,7 @@ class StreamingAudioRecovery:
             matching_session.add_stream(stream_id, ssrc, direction, src_ip, dst_ip, src_port, dst_port, codec)
             self.stream_to_session[stream_id] = matching_session.session_key
             logger.info(f"流 {stream_id} 配对到会话 {matching_session.session_key}")
+            logger.debug(f"  配对会话中已有流: {list(matching_session.streams.keys())}")
             return matching_session
         else:
             # 创建新会话
@@ -268,6 +269,10 @@ class StreamingAudioRecovery:
             
         session = self.active_sessions[session_key]
         logger.info(f"完成会话 {session_key}")
+        
+        # 记录会话中的所有流信息
+        for stream_id, stream_info in session.streams.items():
+            logger.info(f"  流 {stream_id}: SSRC={stream_info['ssrc']}, 方向={stream_info['direction']}, 包数={len(stream_info['packets'])}")
         
         # 生成音频文件
         session.save_audio_files(self.output_dir)
@@ -426,9 +431,28 @@ class StreamingAudioRecovery:
                                     sessions_to_finalize = set()
                                     bye_ssrc_hex = f"{bye_ssrc:08x}"
                                     
+                                    # 计算对应的RTP端口（RTCP端口-1）
+                                    rtp_src_port = src_port - 1 if src_port % 2 == 1 else src_port
+                                    rtp_dst_port = dst_port - 1 if dst_port % 2 == 1 else dst_port
+                                    
+                                    # 使用五元组匹配（SSRC + src_ip + RTP src_port + dst_ip + RTP dst_port）
                                     for stream_id, session_key in self.stream_to_session.items():
+                                        # 检查SSRC匹配
                                         if stream_id.startswith(f"{bye_ssrc_hex}_"):
-                                            sessions_to_finalize.add(session_key)
+                                            # 检查五元组的其他部分是否匹配
+                                            stream_parts = stream_id.split('_')
+                                            if len(stream_parts) >= 5:
+                                                stream_src_ip = stream_parts[1]
+                                                stream_src_port = int(stream_parts[2])
+                                                stream_dst_ip = stream_parts[3]
+                                                stream_dst_port = int(stream_parts[4])
+                                                
+                                                # 检查IP匹配和端口匹配（考虑RTCP端口比RTP端口大1）
+                                                if (stream_src_ip == src_ip and stream_dst_ip == dst_ip and 
+                                                    (stream_src_port == rtp_src_port) and 
+                                                    (stream_dst_port == rtp_dst_port)):
+                                                    sessions_to_finalize.add(session_key)
+                                                    logger.info(f"RTCP BYE匹配RTP流: {stream_id}")
                                     
                                     # 完成相关会话
                                     for session_key in sessions_to_finalize:
@@ -488,18 +512,27 @@ class Session:
     
     def can_pair_with_connection(self, src_ip, dst_ip, src_port, dst_port, direction):
         """检查是否可以与给定的连接配对（双向流：IP和端口互换）"""
+        current_time = time.time()
+        
         for stream_id, stream_info in self.streams.items():
             # 检查是否是双向连接（IP和端口互换，方向不同）
             if (stream_info['src_ip'] == dst_ip and stream_info['dst_ip'] == src_ip and
                 stream_info['src_port'] == dst_port and stream_info['dst_port'] == src_port and
                 stream_info['direction'] != direction):
-                return True
+                
+                # 检查时间窗口 - 只配对最近30秒内的流
+                if 'last_packet_time' not in stream_info or (current_time - stream_info['last_packet_time']) < 30:
+                    logger.debug(f"找到配对流: {stream_id}, 方向: {stream_info['direction']}")
+                    return True
+                else:
+                    logger.debug(f"流 {stream_id} 超过时间窗口 ({current_time - stream_info['last_packet_time']:.2f}秒), 不配对")
         return False
     
     def add_rtp_packet(self, stream_id, rtp_info):
         """添加RTP包到指定流"""
         if stream_id in self.streams:
             self.streams[stream_id]['packets'].append(rtp_info)
+            self.streams[stream_id]['last_packet_time'] = time.time()  # 记录最后包的时间
             self.last_activity = time.time()  # 更新最后活动时间
     
     def get_all_stream_ids(self):
@@ -572,7 +605,9 @@ class Session:
                 continue
             
             # 按序列号排序
-            all_packets.sort(key=lambda p: p['sequence'])
+            # 注意：RTP序列号是16位无符号整数，可能会溢出循环
+            # 使用时间戳更可靠，或者考虑序列号循环
+            all_packets.sort(key=lambda p: p['timestamp'])
             
             # 合并音频数据
             audio_data = b''.join(p['audio_data'] for p in all_packets)
@@ -604,6 +639,42 @@ class Session:
             logger.info(f"  - 编码: {codec}")
             logger.info(f"  - 包数: {len(all_packets)}")
             logger.info(f"  - 时长: {duration:.2f}秒")
+            
+            # 为每个流单独保存一个音频文件，方便对比和调试
+            for i, stream_info in enumerate(stream_list):
+                stream_packets = stream_info['packets']
+                if not stream_packets:
+                    continue
+                    
+                # 按时间戳排序，而不是序列号
+                stream_packets.sort(key=lambda p: p['timestamp'])
+                
+                # 合并音频数据
+                stream_audio_data = b''.join(p['audio_data'] for p in stream_packets)
+                
+                # G711解码
+                stream_codec = stream_info['codec']
+                if stream_codec == "PCMU":
+                    stream_decoded_audio = audioop.ulaw2lin(stream_audio_data, 2)
+                elif stream_codec == "PCMA":
+                    stream_decoded_audio = audioop.alaw2lin(stream_audio_data, 2)
+                else:
+                    stream_decoded_audio = stream_audio_data
+                
+                # 创建AudioSegment
+                stream_audio_segment = AudioSegment(
+                    stream_decoded_audio,
+                    frame_rate=8000,
+                    sample_width=2,
+                    channels=1
+                )
+                
+                # 保存单独的流文件
+                ssrc_hex = f"{stream_info['ssrc']:08x}" if isinstance(stream_info['ssrc'], int) else stream_info['ssrc']
+                debug_filename = f"{direction}_{ssrc_hex}.wav"
+                debug_filepath = session_dir / debug_filename
+                stream_audio_segment.export(str(debug_filepath), format="wav")
+                logger.debug(f"  - 保存单独流音频: {debug_filepath}, 包数: {len(stream_packets)}")
 
 def main():
     import argparse
@@ -614,11 +685,18 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='详细输出')
     parser.add_argument('--use-whitelist', action='store_true', help='启用IP白名单模式')
     parser.add_argument('--whitelist', nargs='+', help='IP白名单列表，例如: --whitelist 192.168.10.91 192.168.5.21')
+    parser.add_argument('--debug', action='store_true', help='启用调试模式，记录更详细的日志')
     
     args = parser.parse_args()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    elif args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        # 添加文件日志处理器
+        file_handler = logging.FileHandler('audio_recovery_debug.log')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(file_handler)
     
     # 验证白名单参数
     if args.use_whitelist and not args.whitelist:
