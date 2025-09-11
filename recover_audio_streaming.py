@@ -9,6 +9,7 @@ import select
 import socket
 import sys
 import io
+import json
 from pathlib import Path
 from collections import defaultdict
 from pydub import AudioSegment
@@ -19,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class StreamingAudioRecovery:
-    def __init__(self, pcap_file, output_dir="extracted_audio", use_whitelist=False, whitelist_ips=None):
+    def __init__(self, pcap_file, output_dir="extracted_audio", use_whitelist=False, whitelist_ips=None, debug_mode=False, zmq_enabled=False, zmq_endpoint="tcp://127.0.0.1:5555", chunk_seconds=0.5):
         self.pcap_file = pcap_file
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -30,6 +31,32 @@ class StreamingAudioRecovery:
         # IP白名单机制
         self.use_whitelist = use_whitelist
         self.whitelisted_ips = set(whitelist_ips) if whitelist_ips else set()
+        
+        # 调试与ZMQ设置
+        self.debug_mode = debug_mode
+        self.zmq_enabled = zmq_enabled
+        self.zmq_endpoint = zmq_endpoint
+        self.chunk_seconds = float(chunk_seconds) if chunk_seconds and float(chunk_seconds) > 0 else 0.5
+        self.sample_rate = 8000
+        self.sample_width_bytes = 2  # s16le
+        self.channels = 1
+        self.chunk_bytes = int(self.sample_rate * self.sample_width_bytes * self.chunk_seconds)
+        
+        self.zmq_ctx = None
+        self.zmq_sock = None
+        if self.zmq_enabled:
+            try:
+                import zmq  # 延迟导入
+                self.zmq_ctx = zmq.Context.instance()
+                # 使用PUSH以便下游用PULL形成队列
+                self.zmq_sock = self.zmq_ctx.socket(zmq.PUSH)
+                self.zmq_sock.connect(self.zmq_endpoint)
+                logger.info(f"已连接ZMQ队列: {self.zmq_endpoint}, chunk时长: {self.chunk_seconds}s, chunk字节: {self.chunk_bytes}")
+            except Exception as e:
+                logger.error(f"初始化ZMQ失败: {e}")
+                self.zmq_enabled = False
+        # 发布函数
+        self.publisher = self._publish_zmq if self.zmq_enabled else None
         
         # 活跃会话管理
         self.active_sessions = {}  # session_key -> Session对象
@@ -45,6 +72,30 @@ class StreamingAudioRecovery:
             logger.info(f"  白名单: {self.whitelisted_ips}")
         else:
             logger.info(f"  白名单模式: 禁用")
+        logger.info(f"  调试模式: {'启用' if self.debug_mode else '禁用'}")
+        if self.zmq_enabled:
+            logger.info(f"  ZMQ输出: 启用 -> {self.zmq_endpoint}")
+        else:
+            logger.info(f"  ZMQ输出: 禁用")
+
+    def _publish_zmq(self, peer_ip, source, pcm_bytes, start_ts, end_ts, is_finished):
+        if not self.zmq_sock:
+            return
+        # 元数据按约定结构
+        meta = {
+            'peer_ip': peer_ip,
+            'source': source,
+            'start_ts': float(start_ts) if start_ts is not None else None,
+            'end_ts': float(end_ts) if end_ts is not None else None,
+            'IsFinished': bool(is_finished)
+        }
+        try:
+            self.zmq_sock.send_multipart([
+                json.dumps(meta, ensure_ascii=False).encode('utf-8'),
+                pcm_bytes
+            ])
+        except Exception as e:
+            logger.error(f"ZMQ发送失败: {e}")
     
     def is_ip_blacklisted(self, ip):
         """检查IP是否在黑名单中"""
@@ -253,7 +304,7 @@ class StreamingAudioRecovery:
             session_key = f"{peer_ip.replace('.', '_')}_{self.session_counter}"
             self.session_counter += 1
             
-            session = Session(session_key, peer_ip)
+            session = Session(session_key, peer_ip, publisher=self.publisher, chunk_bytes=self.chunk_bytes)
             session.add_stream(stream_id, ssrc, direction, src_ip, dst_ip, src_port, dst_port, codec)
             
             self.active_sessions[session_key] = session
@@ -274,8 +325,12 @@ class StreamingAudioRecovery:
         for stream_id, stream_info in session.streams.items():
             logger.info(f"  流 {stream_id}: SSRC={stream_info['ssrc']}, 方向={stream_info['direction']}, 包数={len(stream_info['packets'])}")
         
-        # 生成音频文件
-        session.save_audio_files(self.output_dir)
+        # 发送剩余未满chunk的数据
+        session.flush_pending_chunks()
+        
+        # 生成音频文件（仅调试模式）
+        if self.debug_mode:
+            session.save_audio_files(self.output_dir)
         
         # 清理会话
         for stream_id in session.get_all_stream_ids():
@@ -411,6 +466,8 @@ class StreamingAudioRecovery:
                             
                             # 将RTP数据包添加到会话中
                             if session:
+                                # 附加pcap捕获时间戳
+                                rtp_info['pcap_ts'] = ts
                                 session.add_rtp_packet(stream_id, rtp_info)
                                 
                             processed_packets += 1
@@ -491,11 +548,24 @@ class StreamingAudioRecovery:
     
 
 class Session:
-    def __init__(self, session_key, peer_ip):
+    def __init__(self, session_key, peer_ip, *, publisher=None, chunk_bytes=8000):
         self.session_key = session_key
         self.peer_ip = peer_ip
         self.streams = {}  # stream_id -> {'ssrc', 'direction', 'packets', 'codec', 'connection_info'}
         self.last_activity = time.time()  # 记录最后活动时间
+        
+        # ZMQ发布相关
+        self.publisher = publisher  # callable(peer_ip, direction, pcm_bytes, start_ts, end_ts)
+        self.chunk_bytes = int(chunk_bytes)
+        # 每个方向一个段缓冲队列：[{ 'ts': float, 'pcm': bytes }]
+        self.direction_segments = {
+            'citizen': [],
+            'hotline': []
+        }
+        self.published_any = {
+            'citizen': False,
+            'hotline': False
+        }
         
     def add_stream(self, stream_id, ssrc, direction, src_ip, dst_ip, src_port, dst_port, codec):
         """添加流到会话"""
@@ -534,6 +604,102 @@ class Session:
             self.streams[stream_id]['packets'].append(rtp_info)
             self.streams[stream_id]['last_packet_time'] = time.time()  # 记录最后包的时间
             self.last_activity = time.time()  # 更新最后活动时间
+            # 实时分片并发布到ZMQ（如启用）
+            if self.publisher:
+                self._ingest_and_maybe_publish(self.streams[stream_id]['direction'], self.streams[stream_id]['codec'], rtp_info)
+
+    def _ingest_and_maybe_publish(self, direction, codec, rtp_info):
+        """将单个RTP包解码并加入方向段队列，满足chunk大小则发布"""
+        audio_bytes = rtp_info.get('audio_data', b'')
+        if not audio_bytes:
+            return
+        # G711解码为s16le
+        if codec == "PCMU":
+            try:
+                pcm = audioop.ulaw2lin(audio_bytes, 2)
+            except Exception:
+                pcm = b''
+        elif codec == "PCMA":
+            try:
+                pcm = audioop.alaw2lin(audio_bytes, 2)
+            except Exception:
+                pcm = b''
+        else:
+            pcm = audio_bytes
+        if not pcm:
+            return
+        # 加入段队列
+        seg_list = self.direction_segments.get(direction)
+        if seg_list is None:
+            return
+        seg_list.append({'ts': rtp_info.get('pcap_ts', time.time()), 'pcm': pcm})
+        # 尝试发布尽可能多的完整chunk
+        self._drain_full_chunks(direction)
+
+    def _drain_full_chunks(self, direction):
+        seg_list = self.direction_segments.get(direction)
+        if not seg_list:
+            return
+        total_bytes = sum(len(seg['pcm']) for seg in seg_list)
+        while total_bytes >= self.chunk_bytes:
+            # 组装一个chunk
+            chunk_parts = []
+            consumed = 0
+            start_ts = seg_list[0]['ts']
+            end_ts = start_ts
+            # 从左到右弹出段
+            while seg_list and consumed + len(seg_list[0]['pcm']) <= self.chunk_bytes:
+                seg = seg_list.pop(0)
+                chunk_parts.append(seg['pcm'])
+                consumed += len(seg['pcm'])
+                end_ts = seg['ts']
+            if consumed < self.chunk_bytes and seg_list:
+                # 需要从下一个段切一部分
+                seg = seg_list[0]
+                need = self.chunk_bytes - consumed
+                take = seg['pcm'][:need]
+                remain = seg['pcm'][need:]
+                chunk_parts.append(take)
+                consumed += len(take)
+                end_ts = seg['ts']
+                # 更新剩余段
+                seg_list[0] = {'ts': seg['ts'], 'pcm': remain}
+            # 发布
+            chunk_pcm = b''.join(chunk_parts)
+            self._publish_chunk(direction, chunk_pcm, start_ts, end_ts, is_finished=False)
+            total_bytes -= self.chunk_bytes
+
+    def _publish_chunk(self, direction, pcm_bytes, start_ts, end_ts, is_finished):
+        if not self.publisher or not pcm_bytes:
+            return
+        # 方向映射到所需字符串
+        source = 'citizen' if direction == 'citizen' else 'hot-line'
+        self.publisher(self.peer_ip, source, pcm_bytes, start_ts, end_ts, is_finished)
+        # 标记该方向已发布过数据
+        self.published_any[direction] = True
+
+    def flush_pending_chunks(self):
+        """在会话结束时，发布剩余不足一个chunk的音频（如果有）"""
+        if not self.publisher:
+            # 无需发布
+            self.direction_segments['citizen'].clear()
+            self.direction_segments['hotline'].clear()
+            return
+        for direction in ['citizen', 'hotline']:
+            seg_list = self.direction_segments.get(direction, [])
+            if seg_list:
+                # 组装所有剩余段
+                start_ts = seg_list[0]['ts']
+                end_ts = seg_list[-1]['ts']
+                chunk_pcm = b''.join(seg['pcm'] for seg in seg_list)
+                if chunk_pcm:
+                    self._publish_chunk(direction, chunk_pcm, start_ts, end_ts, is_finished=True)
+                seg_list.clear()
+            else:
+                # 如果恰好落在chunk边界，确保发出结束标记
+                if self.published_any.get(direction, False):
+                    now_ts = time.time()
+                    self._publish_chunk(direction, b'', now_ts, now_ts, is_finished=True)
     
     def get_all_stream_ids(self):
         """获取会话中的所有流ID"""
@@ -685,7 +851,11 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='详细输出')
     parser.add_argument('--use-whitelist', action='store_true', help='启用IP白名单模式')
     parser.add_argument('--whitelist', nargs='+', help='IP白名单列表，例如: --whitelist 192.168.10.91 192.168.5.21')
-    parser.add_argument('--debug', action='store_true', help='启用调试模式，记录更详细的日志')
+    parser.add_argument('--debug', action='store_true', help='启用调试模式，记录更详细的日志，并保存完整音频文件')
+    # ZMQ相关
+    parser.add_argument('--zmq', action='store_true', help='启用ZMQ输出（PUSH模式）')
+    parser.add_argument('--zmq-endpoint', default='tcp://127.0.0.1:5555', help='ZMQ端点（默认: tcp://127.0.0.1:5555）')
+    parser.add_argument('--chunk-seconds', type=float, default=0.5, help='每条消息的音频时长（秒），默认0.5s')
     
     args = parser.parse_args()
     
@@ -703,10 +873,14 @@ def main():
         parser.error("启用白名单模式时必须提供 --whitelist 参数")
     
     recovery = StreamingAudioRecovery(
-        args.pcap_file, 
+        args.pcap_file,
         args.output_dir,
         use_whitelist=args.use_whitelist,
-        whitelist_ips=args.whitelist
+        whitelist_ips=args.whitelist,
+        debug_mode=args.debug,
+        zmq_enabled=args.zmq,
+        zmq_endpoint=args.zmq_endpoint,
+        chunk_seconds=args.chunk_seconds
     )
     recovery.process_pcap_streaming()
 
