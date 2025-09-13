@@ -116,32 +116,18 @@ def main():
             return
 
         try:
-            # 将PCM字节数据转换为numpy数组
-            # 假设是16位PCM，采样率8000Hz
+            # PCM -> numpy -> 升采样 -> 归一化
             audio_array = np.frombuffer(pcm_bytes, dtype=np.int16)
-
-            # 升采样到16kHz
             import scipy.signal
             audio_16k = scipy.signal.resample_poly(audio_array, up=2, down=1)
-            audio_16k = audio_16k.astype(np.float32) / 32768.0  # 转为float32
+            audio_16k = audio_16k.astype(np.float32) / 32768.0
 
-            # 执行语音识别
+            # 语音识别
             result = asr_model.generate(input=audio_16k)
-            print("[DEBUG] ASR原始结果：", result)
             if result and len(result) > 0 and result[0].get('text') is not None:
                 text = result[0]['text'].strip()
-                print("[DEBUG] ASR文本：", text)
-                if text:  # 只打印非空识别结果
-                    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(meta.get('start_ts', time.time())))
-                    print(f"[{timestamp}] [{peer_ip}] [{source}] ASR: {text}")
-                    print(f"  Meta: peer_ip={peer_ip}, source={source}, start_ts={meta.get('start_ts')}, end_ts={meta.get('end_ts')}, chunk_size={len(pcm_bytes)}")
-                    # 保存当前chunk为wav文件
-                    ip_clean = str(peer_ip).replace('.', '_')
-                    out_dir = "chunk_wavs"
-                    os.makedirs(out_dir, exist_ok=True)
-                    wav_path = os.path.join(out_dir, f"{timestamp}_{ip_clean}_{source}_chunk.wav")
-                    write_wav(wav_path, pcm_bytes, sample_rate=8000)
-                    print(f"  [WAV saved]: {wav_path}")
+                if text:
+                    print(f"meta={meta}\ntext={text}")
         except Exception as e:
             print(f"[ASR ERROR] {peer_ip} {source}: {e}")
 
@@ -161,6 +147,7 @@ def main():
         del sessions[key]
         rotate_call(peer_ip, source)
 
+    last_chunk_times = {}
     while running:
         try:
             meta_raw, pcm = sock.recv_multipart(flags=zmq.NOBLOCK)
@@ -179,16 +166,29 @@ def main():
 
         peer_ip = meta.get('peer_ip', 'unknown')
         if peer_ip not in ip_white_list:
-            # print(f"[ZMQ] peer_ip {peer_ip} not in ip_white_list")
             continue
         source = meta.get('source', 'unknown')
         start_ts = meta.get('start_ts')
         end_ts = meta.get('end_ts')
         is_finished = bool(meta.get('IsFinished', False))
 
+        # 分析chunk时间重叠
+        key = (peer_ip, source)
+        last = last_chunk_times.get(key)
+        if last is not None:
+            last_end = last['end_ts']
+            interval = start_ts - last_end if (start_ts is not None and last_end is not None) else None
+            print(f"[CHUNK TIME] {key}: last_end={last_end}, this_start={start_ts}, interval={interval}, this_end={end_ts}")
+            if end_ts is not None and last_end is not None and end_ts < last_end:
+                print(f"[WARNING] chunk end_ts回退: {end_ts} < {last_end}")
+            if start_ts is not None and last_end is not None and start_ts < last_end:
+                print(f"[WARNING] chunk有重叠: start_ts={start_ts} < last_end={last_end}")
+        last_chunk_times[key] = {'start_ts': start_ts, 'end_ts': end_ts}
+
         key, sess = get_session(peer_ip, source, start_ts)
 
         if pcm:
+            print(f"[DEBUG] 收到PCM: len={len(pcm)}, type={type(pcm)}")
             sess['buffer'].extend(pcm)
             sess['bytes'] += len(pcm)
             sess['chunks'] += 1
@@ -198,6 +198,7 @@ def main():
 
             # 实时语音识别
             if asr_model:
+                print(f"[DEBUG] 调用process_asr, peer_ip={peer_ip}, source={source}, chunk_size={len(pcm)}")
                 process_asr(peer_ip, source, pcm, meta, asr_model)
 
         if sess['chunks'] % max(1, args.print_every) == 0:
