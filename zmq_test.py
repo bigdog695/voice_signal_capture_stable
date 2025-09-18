@@ -165,8 +165,8 @@ def main():
             continue
 
         peer_ip = meta.get('peer_ip', 'unknown')
-        if peer_ip not in ip_white_list:
-            continue
+        # if peer_ip not in ip_white_list:
+        #     continue
         source = meta.get('source', 'unknown')
         start_ts = meta.get('start_ts')
         end_ts = meta.get('end_ts')
@@ -203,7 +203,7 @@ def main():
 
         if sess['chunks'] % max(1, args.print_every) == 0:
             print(f"[CHUNK] {peer_ip} {source} call#{key[2]} chunks={sess['chunks']} bytes={sess['bytes']}")
-
+    
         if is_finished:
             # If no bytes and just a finish marker, still close session nicely
             save_and_clear(key, sess)

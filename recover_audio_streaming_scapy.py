@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UDP RTP流式处理脚本 - 直接解析UDP数据中的RTP包
-从FIFO或stdin直接读取UDP数据，解析RTP包，恢复音频会话
+音频恢复流式处理脚本 - 使用scapy版本
+从PCAP文件或stdin流式处理RTP包，恢复音频会话
 """
 
 import argparse
@@ -15,221 +15,13 @@ import json
 from pathlib import Path
 from collections import defaultdict
 from pydub import AudioSegment
-from scapy.all import UDP, IP, Ether, Raw
-import struct
-
-# UDP RTP流处理，不需要PCAP相关导入
-
-class UDPPacketParser:
-    """UDP数据包解析器，直接处理原始UDP数据"""
-    
-    def __init__(self, stream):
-        self.stream = stream
-        self.buffer = b""
-        
-    def _read_with_timeout(self, size, timeout=0.5):
-        """带超时的读取操作"""
-        import signal
-        
-        def timeout_handler(signum, frame):
-            raise TimeoutError("读取超时")
-        
-        # 设置超时
-        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(int(timeout))
-        
-        try:
-            data = self.stream.read(size)
-            signal.alarm(0)  # 取消超时
-            return data
-        except TimeoutError:
-            logger.debug("UDP读取操作超时")
-            return b""
-        finally:
-            signal.signal(signal.SIGALRM, old_handler)
-    
-    def _ensure_data(self, needed_bytes):
-        """确保缓冲区有足够的数据"""
-        while len(self.buffer) < needed_bytes:
-            try:
-                chunk = self._read_with_timeout(4096, 0.5)  # 短超时
-                if not chunk:
-                    return False
-                self.buffer += chunk
-                logger.debug(f"读取了 {len(chunk)} 字节UDP数据，缓冲区现有 {len(self.buffer)} 字节")
-            except Exception as e:
-                logger.debug(f"读取UDP数据出错: {e}")
-                return False
-        return True
-    
-    def _parse_ethernet_frame(self, data):
-        """解析以太网帧"""
-        try:
-            if len(data) < 14:  # 最小以太网帧长度
-                return None
-                
-            # 解析以太网头
-            dst_mac = data[:6]
-            src_mac = data[6:12]
-            eth_type = struct.unpack('>H', data[12:14])[0]
-            
-            if eth_type == 0x0800:  # IPv4
-                return self._parse_ip_packet(data[14:])
-            else:
-                logger.debug(f"非IPv4以太网帧，类型: {eth_type:04x}")
-                return None
-                
-        except Exception as e:
-            logger.debug(f"解析以太网帧出错: {e}")
-            return None
-    
-    def _parse_ip_packet(self, data):
-        """解析IP包"""
-        try:
-            if len(data) < 20:  # 最小IP头长度
-                return None
-                
-            # 解析IP头
-            version_ihl = data[0]
-            version = version_ihl >> 4
-            ihl = version_ihl & 0x0F
-            
-            if version != 4:
-                logger.debug(f"非IPv4包，版本: {version}")
-                return None
-                
-            if ihl < 5:
-                logger.debug(f"IP头长度异常: {ihl}")
-                return None
-                
-            total_length = struct.unpack('>H', data[2:4])[0]
-            protocol = data[9]
-            src_ip = socket.inet_ntoa(data[12:16])
-            dst_ip = socket.inet_ntoa(data[16:20])
-            
-            # 检查总长度是否合理
-            if total_length > len(data) or total_length < 20:
-                logger.debug(f"IP包长度异常: {total_length}")
-                return None
-                
-            if protocol == 17:  # UDP
-                return self._parse_udp_packet(data[20:], src_ip, dst_ip)
-            else:
-                logger.debug(f"非UDP包，协议: {protocol}")
-                return None
-                
-        except Exception as e:
-            logger.debug(f"解析IP包出错: {e}")
-            return None
-    
-    def _parse_udp_packet(self, data, src_ip, dst_ip):
-        """解析UDP包"""
-        try:
-            if len(data) < 8:  # 最小UDP头长度
-                return None
-                
-            # 解析UDP头
-            src_port = struct.unpack('>H', data[0:2])[0]
-            dst_port = struct.unpack('>H', data[2:4])[0]
-            length = struct.unpack('>H', data[4:6])[0]
-            checksum = struct.unpack('>H', data[6:8])[0]
-            
-            # 检查UDP长度
-            if length < 8 or length > len(data):
-                logger.debug(f"UDP长度异常: {length}")
-                return None
-                
-            # 提取UDP载荷
-            payload = data[8:length]
-            
-            return {
-                'src_ip': src_ip,
-                'dst_ip': dst_ip,
-                'src_port': src_port,
-                'dst_port': dst_port,
-                'payload': payload,
-                'timestamp': time.time()
-            }
-            
-        except Exception as e:
-            logger.debug(f"解析UDP包出错: {e}")
-            return None
-    
-    def read_packet(self):
-        """读取下一个UDP包"""
-        try:
-            # 尝试读取一个完整的以太网帧
-            if not self._ensure_data(14):  # 至少需要以太网头
-                return None
-                
-            # 检查以太网帧长度
-            if len(self.buffer) < 14:
-                return None
-                
-            # 读取以太网头获取长度信息
-            eth_type = struct.unpack('>H', self.buffer[12:14])[0]
-            
-            if eth_type == 0x0800:  # IPv4
-                # 需要读取IP头来获取总长度
-                if not self._ensure_data(34):  # 以太网头(14) + IP头(20)
-                    return None
-                    
-                total_length = struct.unpack('>H', self.buffer[16:18])[0]
-                frame_length = 14 + total_length  # 以太网头 + IP包长度
-                
-                if not self._ensure_data(frame_length):
-                    return None
-                    
-                # 提取完整帧
-                frame_data = self.buffer[:frame_length]
-                self.buffer = self.buffer[frame_length:]
-                
-                # 解析帧
-                udp_info = self._parse_ethernet_frame(frame_data)
-                return udp_info
-            else:
-                # 非IPv4帧，跳过
-                logger.debug(f"跳过非IPv4帧，类型: {eth_type:04x}")
-                self.buffer = self.buffer[1:]  # 跳过一个字节重新同步
-                return self.read_packet()  # 递归重试
-                
-        except Exception as e:
-            logger.debug(f"读取UDP包出错: {e}")
-            # 出错时跳过一些数据
-            if len(self.buffer) > 0:
-                self.buffer = self.buffer[1:]
-            return None
+from scapy.all import *
+from scapy.utils import rdpcap
+import io
 
 # 设置日志
-import sys
-# 创建一个自定义的日志处理器，强制输出到stdout
-class StdoutHandler(logging.StreamHandler):
-    def __init__(self):
-        super().__init__(sys.stdout)
-    
-    def emit(self, record):
-        # 确保日志输出到stdout
-        try:
-            msg = self.format(record)
-            sys.stdout.write(msg + '\n')
-            sys.stdout.flush()
-        except Exception:
-            self.handleError(record)
-
-# 配置日志
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# 清除现有的处理器
-logger.handlers.clear()
-
-# 添加自定义的stdout处理器
-stdout_handler = StdoutHandler()
-stdout_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-logger.addHandler(stdout_handler)
-
-# 防止日志传播到根logger
-logger.propagate = False
 
 # 导入ZMQ（如果可用）
 try:
@@ -469,15 +261,21 @@ class AudioRecovery:
         del self.active_sessions[session_key]
         logger.info(f"会话 {session_key} 已清理")
 
-    def _process_udp_packet(self, udp_info):
-        """处理UDP数据包"""
+    def _process_scapy_packet(self, pkt):
+        """使用scapy处理单个数据包"""
         try:
-            src_ip = udp_info['src_ip']
-            dst_ip = udp_info['dst_ip']
-            src_port = udp_info['src_port']
-            dst_port = udp_info['dst_port']
-            payload_bytes = udp_info['payload']
-            ts = udp_info['timestamp']
+            # 检查是否是UDP包
+            if not pkt.haslayer(UDP):
+                return
+            
+            # 提取IP和UDP信息
+            ip_layer = pkt[IP]
+            udp_layer = pkt[UDP]
+            
+            src_ip = ip_layer.src
+            dst_ip = ip_layer.dst
+            src_port = udp_layer.sport
+            dst_port = udp_layer.dport
             
             # 过滤掉不包含热线服务器IP的包
             if self.hotline_server_ip not in [src_ip, dst_ip]:
@@ -487,11 +285,16 @@ class AudioRecovery:
             if not self.should_process_ip(src_ip, dst_ip):
                 return
             
+            # 获取UDP载荷
+            payload_bytes = bytes(udp_layer.payload)
             if not payload_bytes:
                 return
             
             # 将payload_bytes转换为十六进制字符串，以便使用现有的解析函数
             payload_hex = ''.join(f'{b:02x}' for b in payload_bytes)
+            
+            # 获取时间戳
+            ts = float(pkt.time) if hasattr(pkt, 'time') else time.time()
             
             # 尝试解析为RTP包
             rtp_info = self.parse_rtp_packet(payload_hex)
@@ -510,7 +313,7 @@ class AudioRecovery:
                 
                 # 将RTP数据包添加到会话中
                 if session:
-                    # 附加时间戳
+                    # 附加pcap捕获时间戳
                     rtp_info['pcap_ts'] = ts
                     rtp_info['src_ip'] = src_ip
                     rtp_info['dst_ip'] = dst_ip
@@ -561,58 +364,44 @@ class AudioRecovery:
                         continue
                         
         except Exception as e:
-            logger.debug(f"处理UDP数据包时出错: {e}")
+            logger.debug(f"处理scapy数据包时出错: {e}")
             return
 
-    def process_udp_streaming(self):
-        """流式处理UDP数据，直接解析RTP包"""
-        # 打开FIFO文件或stdin
+    def process_pcap_streaming(self):
+        """流式处理PCAP文件或stdin，使用scapy库替代dpkt"""
+        # 打开pcap文件或stdin
         if self.pcap_file == '/dev/stdin':
-            logger.info("开始流式处理stdin UDP数据")
+            logger.info("开始流式处理stdin数据")
             input_stream = sys.stdin.buffer  # 二进制模式读取stdin
         else:
-            logger.info(f"开始流式处理UDP文件: {self.pcap_file}")
+            logger.info(f"开始流式处理PCAP文件: {self.pcap_file}")
             input_stream = open(self.pcap_file, 'rb')
         
         try:
-            logger.info("开始实时处理UDP数据流...")
+            logger.info("开始实时处理数据流...")
             processed_packets = 0
             last_activity_time = time.time()
             
-            logger.info("开始持续监听UDP数据流...")
+            logger.info("开始持续监听数据流...")
             
-            # 使用UDP解析器进行流式处理
-            udp_parser = UDPPacketParser(input_stream)
+            # 使用scapy进行流式处理
+            buffer = b""
             
             # 持续读取数据包
             while True:
                 try:
                     logger.debug("=== 开始新的循环迭代 ===")
                     
-                    # 使用select检查数据可用性（对stdin和FIFO等特殊文件）
-                    # 检查是否是普通文件，如果不是则使用select
-                    should_use_select = (self.pcap_file == '/dev/stdin' or 
-                                       self.pcap_file.startswith('/tmp/') or
-                                       not Path(self.pcap_file).is_file())
-                    
-                    if should_use_select:
-                        try:
-                            logger.debug("准备执行select检查...")
-                            ready = select.select([input_stream], [], [], 0.5)[0]  # 缩短超时时间
-                            logger.debug(f"select完成，结果: {bool(ready)}")
-                        except Exception as select_error:
-                            logger.error(f"select调用出错: {select_error}")
-                            # select出错，可能是FIFO有问题，短暂等待后继续
-                            time.sleep(0.5)
-                            continue
-                        
+                    # 使用select检查数据可用性（仅对stdin）
+                    if self.pcap_file == '/dev/stdin':
+                        ready = select.select([input_stream], [], [], 1.0)[0]
                         if not ready:
                             # 检查超时和会话状态
                             current_time = time.time()
                             if current_time - last_activity_time > 30:
                                 active_count = len(self.active_sessions)
                                 if active_count > 0:
-                                    logger.info(f"等待UDP数据中... (活跃会话: {active_count}, 已处理: {processed_packets} 包)")
+                                    logger.info(f"等待数据中... (活跃会话: {active_count}, 已处理: {processed_packets} 包)")
                                     # 检查会话超时
                                     timeout_sessions = []
                                     for session_key, session in self.active_sessions.items():
@@ -630,35 +419,73 @@ class AudioRecovery:
                                 last_activity_time = current_time
                             continue
                     
-                    # 使用UDP解析器进行流式解析
+                    # 读取数据到缓冲区
                     try:
-                        logger.debug("准备调用UDPPacketParser.read_packet()...")
-                        udp_info = udp_parser.read_packet()
-                        if udp_info is None:
-                            logger.debug("UDP解析器返回None，等待更多数据")
-                            time.sleep(0.5)
+                        chunk = input_stream.read(8192)  # 读取8KB数据
+                        if not chunk:
+                            logger.debug("没有读取到数据，等待...")
+                            time.sleep(0.1)
                             continue
                         
-                        logger.debug(f"✓ UDP解析器成功读取数据包: {udp_info['src_ip']}:{udp_info['src_port']} -> {udp_info['dst_ip']}:{udp_info['dst_port']}")
+                        buffer += chunk
+                        logger.debug(f"读取了 {len(chunk)} 字节，缓冲区总大小: {len(buffer)}")
                         
-                        # 处理UDP包
-                        self._process_udp_packet(udp_info)
-                        processed_packets += 1
-                        last_activity_time = time.time()
-                        
-                        if processed_packets % 100 == 0:
-                            logger.debug(f"已处理 {processed_packets} 个UDP包")
-                            
-                    except Exception as udp_error:
-                        logger.debug(f"UDP解析器读取出错: {udp_error}")
-                        # UDP解析出错，等待一下继续
-                        time.sleep(0.5)
+                    except Exception as e:
+                        logger.error(f"读取数据流出错: {e}")
+                        buffer = b""  # 清空缓冲区
+                        time.sleep(1)
                         continue
+                    
+                    # 尝试从缓冲区解析数据包
+                    try:
+                        # 如果缓冲区太小，继续读取
+                        if len(buffer) < 100:  # 至少需要基本的PCAP头和包数据
+                            continue
+                        
+                        # 创建临时流用于scapy解析
+                        temp_stream = io.BytesIO(buffer)
+                        
+                        try:
+                            # 尝试批量读取数据包
+                            packets = rdpcap(temp_stream, count=100)  # 最多读取100个包
+                            logger.debug(f"✓ 成功解析 {len(packets)} 个数据包")
                             
-                except Exception as e:
-                    logger.error(f"处理UDP数据流时出错: {e}")
-                    time.sleep(1)
-                    continue
+                            # 处理解析到的数据包
+                            for pkt in packets:
+                                try:
+                                    self._process_scapy_packet(pkt)
+                                    processed_packets += 1
+                                    last_activity_time = time.time()
+                                    
+                                    if processed_packets % 100 == 0:
+                                        logger.debug(f"已处理 {processed_packets} 个数据包")
+                                        
+                                except Exception as pkt_error:
+                                    logger.debug(f"处理单个数据包出错: {pkt_error}")
+                                    continue
+                            
+                            # 成功处理后清空缓冲区
+                            buffer = b""
+                            
+                        except Exception as parse_error:
+                            logger.debug(f"scapy解析出错: {parse_error}")
+                            
+                            # 解析失败，可能是数据不完整或损坏
+                            if len(buffer) > 16384:  # 如果缓冲区超过16KB
+                                # 保留后半部分，丢弃前半部分可能损坏的数据
+                                buffer = buffer[8192:]
+                                logger.debug("缓冲区过大，保留后半部分数据")
+                            elif len(buffer) > 65536:  # 如果超过64KB，完全清空
+                                logger.warning("缓冲区过大且无法解析，清空重新开始")
+                                buffer = b""
+                            
+                            continue
+                            
+                    except Exception as e:
+                        logger.error(f"处理缓冲区数据时出错: {e}")
+                        buffer = b""  # 清空缓冲区重新开始
+                        time.sleep(1)
+                        continue
                         
                 except KeyboardInterrupt:
                     logger.info("收到中断信号，正在停止...")
@@ -673,10 +500,10 @@ class AudioRecovery:
                 logger.info(f"处理剩余会话 {session_key}")
                 self.finalize_session(session_key)
             
-            logger.info(f"UDP流式处理完成！总共处理了 {processed_packets} 个UDP包")
+            logger.info(f"流式处理完成！总共处理了 {processed_packets} 个数据包")
             
         except Exception as e:
-            logger.error(f"处理UDP文件出错: {e}")
+            logger.error(f"处理pcap文件出错: {e}")
             raise
         finally:
             # 关闭文件（如果不是stdin）
@@ -692,9 +519,9 @@ class AudioRecovery:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='从UDP流式恢复音频会话 - 直接解析RTP包')
+    parser = argparse.ArgumentParser(description='从PCAP流式恢复音频会话 - Scapy版本')
     parser.add_argument('pcap_file', nargs='?', default='/dev/stdin',
-                       help='UDP数据文件路径或/dev/stdin (默认: /dev/stdin)')
+                       help='PCAP文件路径或/dev/stdin (默认: /dev/stdin)')
     parser.add_argument('--output-dir', default='./extracted_audio',
                        help='输出目录 (默认: ./extracted_audio)')
     parser.add_argument('--hotline-server-ip', default='192.168.0.201',
@@ -720,7 +547,7 @@ def main():
     
     try:
         # 开始处理
-        recovery.process_udp_streaming()
+        recovery.process_pcap_streaming()
     except KeyboardInterrupt:
         logger.info("用户中断")
     except Exception as e:

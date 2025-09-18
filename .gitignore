@@ -1,2 +1,4 @@
 extracted_audio
+zmq_received
+chunk_wavs
 __pycache__

@@ -24,7 +24,7 @@ MAX_PACKET_SIZE = 65535  # Maximum reasonable packet size
 # Start recover_audio_streaming.py subprocess
 proc = subprocess.Popen(
     [
-        "python3", "recover_audio_streaming.py", "/dev/stdin"
+        "python3", "recover_audio_streaming.py", "/dev/stdin", "extracted_audio", "--zmq", "--zmq-endpoint", "tcp://127.0.0.1:5555", "--chunk-seconds", "2"
     ],
     stdin=subprocess.PIPE
 )
